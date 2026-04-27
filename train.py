@@ -2,23 +2,25 @@ import os
 from pathlib import Path
 from PIL import Image
 
+import pandas as pd
+
 import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
 
 # =========================================================
 # 1. Paths
 # =========================================================
-DATASET_ROOT = "/home/linuxu/Nir/exported_dataset_with_augmentation"
-
-TRAIN_DIR = os.path.join(DATASET_ROOT, "train")
-VAL_DIR = os.path.join(DATASET_ROOT, "val")
-TEST_DIR = os.path.join(DATASET_ROOT, "test")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "Data"
+TRAIN_CSV = DATA_DIR / "train_split.csv"
+VAL_CSV = DATA_DIR / "val_split.csv"
+TEST_CSV = DATA_DIR / "test_split.csv"
 
 # =========================================================
 # 2. Config
 # =========================================================
-IMG_SIZE = 64
+IMG_SIZE = 256
 BATCH_SIZE = 32
 NUM_WORKERS = 2
 
@@ -40,11 +42,80 @@ eval_transform = transforms.Compose([
 ])
 
 # =========================================================
+# 4. Dataset
+# =========================================================
+class ImageCSVDataset(Dataset):
+    def __init__(self, csv_path, transform=None):
+        self.csv_path = Path(csv_path)
+        self.transform = transform
+        self.data = pd.read_csv(self.csv_path)
+
+        if "pain_label" not in self.data.columns:
+            raise KeyError(f"{self.csv_path} must contain a 'pain_label' column.")
+
+        image_column_candidates = ["resized_file_path", "file_path"]
+        self.image_column = next((col for col in image_column_candidates if col in self.data.columns), None)
+        if self.image_column is None:
+            raise KeyError(
+                f"{self.csv_path} must contain one of {image_column_candidates} columns with image paths."
+            )
+
+        self.data = self.data[self.data["pain_label"].notna()].copy()
+        self.data[self.image_column] = self.data[self.image_column].astype(str)
+
+        self.data["_resolved_image_path"] = self.data[self.image_column].apply(self._resolve_image_path)
+        self.data = self.data[self.data["_resolved_image_path"].apply(Path.exists)].copy()
+
+        raw_labels = sorted(pd.to_numeric(self.data["pain_label"], errors="coerce").dropna().unique().tolist())
+        if not raw_labels:
+            raise ValueError(f"{self.csv_path} does not contain any valid pain_label values.")
+
+        self.label_to_index = {label: index for index, label in enumerate(raw_labels)}
+        self.index_to_label = {index: label for label, index in self.label_to_index.items()}
+        self.data["pain_label"] = pd.to_numeric(self.data["pain_label"], errors="coerce").map(self.label_to_index)
+        self.data = self.data[self.data["pain_label"].notna()].copy()
+        self.data["pain_label"] = self.data["pain_label"].astype(int)
+
+        self.samples = [
+            (row["_resolved_image_path"], int(row["pain_label"]))
+            for _, row in self.data.iterrows()
+        ]
+        self.classes = [str(label) for label in raw_labels]
+
+    def _resolve_image_path(self, image_path):
+        path = Path(image_path)
+        if path.is_absolute():
+            return path
+
+        candidates = [
+            PROJECT_ROOT / path,
+            PROJECT_ROOT.parent / path,
+            DATA_DIR / path,
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate.resolve()
+
+        return (PROJECT_ROOT / path).resolve()
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        image_path, label = self.samples[index]
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            if self.transform is not None:
+                image = self.transform(image)
+        return image, label
+
+# =========================================================
 # 4. Datasets
 # =========================================================
-train_dataset = datasets.ImageFolder(root=TRAIN_DIR, transform=train_transform)
-val_dataset = datasets.ImageFolder(root=VAL_DIR, transform=eval_transform)
-test_dataset = datasets.ImageFolder(root=TEST_DIR, transform=eval_transform)
+train_dataset = ImageCSVDataset(TRAIN_CSV, transform=train_transform)
+val_dataset = ImageCSVDataset(VAL_CSV, transform=eval_transform)
+test_dataset = ImageCSVDataset(TEST_CSV, transform=eval_transform)
 
 # =========================================================
 # 5. DataLoaders
