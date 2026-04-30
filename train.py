@@ -1,11 +1,13 @@
 import os
 from pathlib import Path
+from collections import Counter
 from PIL import Image
 
 import pandas as pd
-
+import opencv2 as cv2
 import torch
-from torch.utils.data import DataLoader, Dataset
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
 # =========================================================
@@ -28,17 +30,15 @@ NUM_WORKERS = 2
 # 3. Transforms
 # =========================================================
 train_transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
 eval_transform = transforms.Compose([
-    transforms.Grayscale(num_output_channels=1),
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5], std=[0.5])
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
 # =========================================================
@@ -54,16 +54,17 @@ class ImageCSVDataset(Dataset):
             raise KeyError(f"{self.csv_path} must contain a 'pain_label' column.")
 
         image_column_candidates = ["resized_file_path", "file_path"]
-        self.image_column = next((col for col in image_column_candidates if col in self.data.columns), None)
-        if self.image_column is None:
+        self.image_columns = [col for col in image_column_candidates if col in self.data.columns]
+        if not self.image_columns:
             raise KeyError(
                 f"{self.csv_path} must contain one of {image_column_candidates} columns with image paths."
             )
 
         self.data = self.data[self.data["pain_label"].notna()].copy()
-        self.data[self.image_column] = self.data[self.image_column].astype(str)
+        for column in self.image_columns:
+            self.data[column] = self.data[column].astype(str)
 
-        self.data["_resolved_image_path"] = self.data[self.image_column].apply(self._resolve_image_path)
+        self.data["_resolved_image_path"] = self.data.apply(self._resolve_row_image_path, axis=1)
         self.data = self.data[self.data["_resolved_image_path"].apply(Path.exists)].copy()
 
         raw_labels = sorted(pd.to_numeric(self.data["pain_label"], errors="coerce").dropna().unique().tolist())
@@ -99,6 +100,19 @@ class ImageCSVDataset(Dataset):
 
         return (PROJECT_ROOT / path).resolve()
 
+    def _resolve_row_image_path(self, row):
+        for column in self.image_columns:
+            image_path = str(row.get(column, "")).strip()
+            if not image_path:
+                continue
+
+            resolved_path = self._resolve_image_path(image_path)
+            if resolved_path.exists():
+                return resolved_path
+
+        fallback_value = str(row.get(self.image_columns[0], "")).strip()
+        return self._resolve_image_path(fallback_value)
+
     def __len__(self):
         return len(self.samples)
 
@@ -118,12 +132,35 @@ val_dataset = ImageCSVDataset(VAL_CSV, transform=eval_transform)
 test_dataset = ImageCSVDataset(TEST_CSV, transform=eval_transform)
 
 # =========================================================
-# 5. DataLoaders
+# 5. Labels and sampling
+# =========================================================
+train_labels = [label for _, label in train_dataset.samples]
+val_labels = [label for _, label in val_dataset.samples]
+test_labels = [label for _, label in test_dataset.samples]
+
+train_label_counts = Counter(train_labels)
+val_label_counts = Counter(val_labels)
+test_label_counts = Counter(test_labels)
+
+num_present_classes = len(train_label_counts)
+num_train_samples = len(train_labels)
+sample_weights = [
+    num_train_samples / (num_present_classes * train_label_counts[label])
+    for label in train_labels
+]
+train_sampler = WeightedRandomSampler(
+    weights=torch.DoubleTensor(sample_weights),
+    num_samples=len(sample_weights),
+    replacement=True
+)
+
+# =========================================================
+# 6. DataLoaders
 # =========================================================
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
-    shuffle=True,
+    sampler=train_sampler,
     num_workers=NUM_WORKERS
 )
 
@@ -142,7 +179,7 @@ test_loader = DataLoader(
 )
 
 # =========================================================
-# 6. Info
+# 7. Info
 # =========================================================
 class_names = train_dataset.classes
 num_classes = len(class_names)
@@ -155,49 +192,36 @@ print("Test size:", len(test_dataset))
 
 # Optional: inspect one batch
 images, labels = next(iter(train_loader))
-print("Batch images shape:", images.shape)   # expected: [B, 1, H, W]
+print("Batch images shape:", images.shape)   # expected: [B, 3, H, W]
 print("Batch labels shape:", labels.shape)
-from collections import Counter
-
-train_labels = [label for _, label in train_dataset.samples]
-val_labels = [label for _, label in val_dataset.samples]
-test_labels = [label for _, label in test_dataset.samples]
-
-print("Train:", Counter(train_labels))
-print("Val:", Counter(val_labels))
-print("Test:", Counter(test_labels))
-
-from collections import Counter
-import torch
-import torch.nn as nn
+print("Train:", train_label_counts)
+print("Val:", val_label_counts)
+print("Test:", test_label_counts)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-train_label_counts = Counter(train_labels)
 print("Train label counts:", train_label_counts)
 
 total_samples = sum(train_label_counts.values())
-num_classes = len(train_label_counts)
+num_classes = len(class_names)
 
 class_weights = []
 for class_idx in range(num_classes):
-    class_count = train_label_counts[class_idx]
-    weight = total_samples / (num_classes * class_count)
+    class_count = train_label_counts.get(class_idx, 0)
+    weight = 0.0 if class_count == 0 else total_samples / (num_classes * class_count)
     class_weights.append(weight)
 
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
 
 print("Class weights:", class_weights)
 
-import torch.nn as nn
-
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes, img_size=64):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(),
             nn.MaxPool2d(2),   # 64 -> 32
