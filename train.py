@@ -4,7 +4,6 @@ from collections import Counter
 from PIL import Image
 
 import pandas as pd
-import opencv2 as cv2
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -16,8 +15,10 @@ from torchvision import transforms
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "Data"
 TRAIN_CSV = DATA_DIR / "train_split.csv"
+TRAIN_AUGMENTED_CSV = DATA_DIR / "c" / "New_Augmentation" / "train_manifest_augmented.csv"
 VAL_CSV = DATA_DIR / "val_split.csv"
 TEST_CSV = DATA_DIR / "test_split.csv"
+NEW_AUGMENTATION_DIR = DATA_DIR / "c" / "New_Augmentation"
 
 # =========================================================
 # 2. Config
@@ -25,6 +26,7 @@ TEST_CSV = DATA_DIR / "test_split.csv"
 IMG_SIZE = 256
 BATCH_SIZE = 32
 NUM_WORKERS = 2
+PRED_THRESHOLD = 0.6
 
 # =========================================================
 # 3. Transforms
@@ -45,37 +47,63 @@ eval_transform = transforms.Compose([
 # 4. Dataset
 # =========================================================
 class ImageCSVDataset(Dataset):
-    def __init__(self, csv_path, transform=None):
-        self.csv_path = Path(csv_path)
+    def __init__(self, csv_path, transform=None, clean_conflicts=False):
+        csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+        self.csv_paths = [Path(path) for path in csv_paths]
         self.transform = transform
-        self.data = pd.read_csv(self.csv_path)
-
-        if "pain_label" not in self.data.columns:
-            raise KeyError(f"{self.csv_path} must contain a 'pain_label' column.")
-
+        self.clean_conflicts = clean_conflicts
         image_column_candidates = ["resized_file_path", "file_path"]
-        self.image_columns = [col for col in image_column_candidates if col in self.data.columns]
-        if not self.image_columns:
-            raise KeyError(
-                f"{self.csv_path} must contain one of {image_column_candidates} columns with image paths."
-            )
+        frames = []
 
-        self.data = self.data[self.data["pain_label"].notna()].copy()
-        for column in self.image_columns:
-            self.data[column] = self.data[column].astype(str)
+        for csv_file in self.csv_paths:
+            data = pd.read_csv(csv_file)
+
+            if "pain_label" not in data.columns:
+                raise KeyError(f"{csv_file} must contain a 'pain_label' column.")
+
+            image_columns = [col for col in image_column_candidates if col in data.columns]
+            if not image_columns:
+                raise KeyError(
+                    f"{csv_file} must contain one of {image_column_candidates} columns with image paths."
+                )
+
+            data = data[data["pain_label"].notna()].copy()
+
+            # Keep only generated augmented rows from the augmented manifest.
+            if csv_file.name == TRAIN_AUGMENTED_CSV.name and "is_augmented" in data.columns:
+                data = data[pd.to_numeric(data["is_augmented"], errors="coerce") == 1].copy()
+
+            for column in image_columns:
+                data[column] = data[column].fillna("").astype(str)
+
+            frames.append(data)
+
+        self.data = pd.concat(frames, ignore_index=True)
+        self.image_columns = [col for col in image_column_candidates if col in self.data.columns]
 
         self.data["_resolved_image_path"] = self.data.apply(self._resolve_row_image_path, axis=1)
         self.data = self.data[self.data["_resolved_image_path"].apply(Path.exists)].copy()
 
         raw_labels = sorted(pd.to_numeric(self.data["pain_label"], errors="coerce").dropna().unique().tolist())
         if not raw_labels:
-            raise ValueError(f"{self.csv_path} does not contain any valid pain_label values.")
+            joined_paths = ", ".join(str(path) for path in self.csv_paths)
+            raise ValueError(f"{joined_paths} does not contain any valid pain_label values.")
 
         self.label_to_index = {label: index for index, label in enumerate(raw_labels)}
         self.index_to_label = {index: label for label, index in self.label_to_index.items()}
         self.data["pain_label"] = pd.to_numeric(self.data["pain_label"], errors="coerce").map(self.label_to_index)
         self.data = self.data[self.data["pain_label"].notna()].copy()
         self.data["pain_label"] = self.data["pain_label"].astype(int)
+
+        if self.clean_conflicts:
+            # Keep one label per image path; if duplicates conflict, use the modal label for that path.
+            path_mode_label = self.data.groupby("_resolved_image_path")["pain_label"].agg(
+                lambda values: values.mode().iloc[0]
+            )
+            self.data["pain_label"] = self.data["_resolved_image_path"].map(path_mode_label).astype(int)
+
+            # Keep one row per resolved image path so augmented images are added once each.
+            self.data = self.data.drop_duplicates(subset=["_resolved_image_path"], keep="first").copy()
 
         self.samples = [
             (row["_resolved_image_path"], int(row["pain_label"]))
@@ -84,15 +112,32 @@ class ImageCSVDataset(Dataset):
         self.classes = [str(label) for label in raw_labels]
 
     def _resolve_image_path(self, image_path):
-        path = Path(image_path)
+        image_path_str = str(image_path).strip()
+        path = Path(image_path_str)
         if path.is_absolute():
             return path
 
-        candidates = [
-            PROJECT_ROOT / path,
-            PROJECT_ROOT.parent / path,
-            DATA_DIR / path,
-        ]
+        # Support both .../train/... and .../Train/... paths on case-sensitive filesystems.
+        # Also support mapping Data/New_Augmentation to Data/c/New_Augmentation
+        path_variants = [image_path_str]
+        if "exported_dataset_with_augmentation/train/" in image_path_str:
+            path_variants.append(
+                image_path_str.replace("exported_dataset_with_augmentation/train/", "exported_dataset_with_augmentation/Train/")
+            )
+        if "Data/New_Augmentation/" in image_path_str:
+            path_variants.append(
+                image_path_str.replace("Data/New_Augmentation/", "Data/c/New_Augmentation/")
+            )
+
+        candidates = []
+        for path_variant in path_variants:
+            variant_path = Path(path_variant)
+            candidates.extend([
+                PROJECT_ROOT / variant_path,
+                PROJECT_ROOT.parent / variant_path,
+                DATA_DIR / variant_path,
+                NEW_AUGMENTATION_DIR / variant_path,
+            ])
 
         for candidate in candidates:
             if candidate.exists():
@@ -127,9 +172,9 @@ class ImageCSVDataset(Dataset):
 # =========================================================
 # 4. Datasets
 # =========================================================
-train_dataset = ImageCSVDataset(TRAIN_CSV, transform=train_transform)
-val_dataset = ImageCSVDataset(VAL_CSV, transform=eval_transform)
-test_dataset = ImageCSVDataset(TEST_CSV, transform=eval_transform)
+train_dataset = ImageCSVDataset([TRAIN_CSV, TRAIN_AUGMENTED_CSV], transform=train_transform, clean_conflicts=True)
+val_dataset = ImageCSVDataset(VAL_CSV, transform=eval_transform, clean_conflicts=False)
+test_dataset = ImageCSVDataset(TEST_CSV, transform=eval_transform, clean_conflicts=False)
 
 # =========================================================
 # 5. Labels and sampling
@@ -221,27 +266,36 @@ class SimpleCNN(nn.Module):
         super().__init__()
 
         self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(3, 24, kernel_size=9, padding=4),
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            nn.MaxPool2d(2),   # 256 -> 128
+            nn.Dropout2d(p=0.28),
+
+            nn.Conv2d(24, 48, kernel_size=7, padding=3),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.MaxPool2d(2),   # 128 -> 64
+            nn.Dropout2d(p=0.28),
+
+            nn.Conv2d(48, 96, kernel_size=7, padding=3),
+            nn.BatchNorm2d(96),
             nn.ReLU(),
             nn.MaxPool2d(2),   # 64 -> 32
+            nn.Dropout2d(p=0.28),
 
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 32 -> 16
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.Conv2d(96, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2)    # 16 -> 8
+            nn.MaxPool2d(2)    # 32 -> 16
         )
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(128 * (img_size // 8) * (img_size // 8), 256),
+            nn.Dropout(p=0.25),
+            nn.Linear(128 * (img_size // 16) * (img_size // 16), 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(p=0.25),
             nn.Linear(256, num_classes)
         )
 
@@ -252,8 +306,15 @@ class SimpleCNN(nn.Module):
         
 model = SimpleCNN(num_classes=num_classes, img_size=IMG_SIZE).to(device)
 
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer,
+    mode="min",
+    factor=0.7,
+    patience=12,
+    verbose=True
+)
 
 print(model)
 
@@ -281,7 +342,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
 
         running_loss += loss.item() * images.size(0)
 
-        preds = torch.argmax(outputs, dim=1)
+        probs = torch.softmax(outputs, dim=1)
+        preds = (probs[:, 1] >= PRED_THRESHOLD).long()
 
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.detach().cpu().numpy())
@@ -312,7 +374,8 @@ def evaluate(model, loader, criterion, device):
 
             running_loss += loss.item() * images.size(0)
 
-            preds = torch.argmax(outputs, dim=1)
+            probs = torch.softmax(outputs, dim=1)
+            preds = (probs[:, 1] >= PRED_THRESHOLD).long()
 
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -325,9 +388,13 @@ def evaluate(model, loader, criterion, device):
 
     return epoch_loss, epoch_acc, epoch_f1, epoch_precision, epoch_recall, all_labels, all_preds
     
-NUM_EPOCHS = 5000
+NUM_EPOCHS = 1000
+best_val_acc = -1
 best_val_f1 = -1
 best_model_path = "best_simple_cnn.pth"
+best_model_weights = None
+early_stop_patience = 150
+epochs_without_improvement = 0
 
 history = []
 
@@ -339,6 +406,8 @@ for epoch in range(NUM_EPOCHS):
     val_loss, val_acc, val_f1, val_precision, val_recall, _, _ = evaluate(
         model, val_loader, criterion, device
     )
+
+    scheduler.step(val_loss)
 
     history.append({
         "epoch": epoch + 1,
@@ -363,13 +432,25 @@ for epoch in range(NUM_EPOCHS):
         f"Val   | Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | "
         f"F1: {val_f1:.4f} | Precision: {val_precision:.4f} | Recall: {val_recall:.4f}"
     )
+    print(f"LR    | {optimizer.param_groups[0]['lr']:.6f}")
     print("-" * 80)
 
-    if val_f1 > best_val_f1:
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
         best_val_f1 = val_f1
-        torch.save(model.state_dict(), best_model_path)
+        best_model_weights = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        torch.save(best_model_weights, best_model_path)
+        print(f"Saved best model with validation accuracy: {val_acc:.4f}")
+        epochs_without_improvement = 0
+    else:
+        epochs_without_improvement += 1
+
+    if epochs_without_improvement >= early_stop_patience:
+        print(f"Early stopping triggered after {epoch + 1} epochs without improvement in validation accuracy.")
+        break
 
 print(f"Best model saved to: {best_model_path}")
+print(f"Best validation accuracy: {best_val_acc:.4f}")
 print(f"Best validation F1: {best_val_f1:.4f}")
 
 history_df = pd.DataFrame(history)
@@ -378,7 +459,10 @@ history_df.head()
 
 from sklearn.metrics import confusion_matrix, classification_report
 
-model.load_state_dict(torch.load(best_model_path, map_location=device))
+if best_model_weights is not None:
+    model.load_state_dict(best_model_weights)
+else:
+    model.load_state_dict(torch.load(best_model_path, map_location=device))
 
 val_loss, val_acc, val_f1, val_precision, val_recall, val_true, val_pred = evaluate(
     model, val_loader, criterion, device
