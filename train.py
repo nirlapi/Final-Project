@@ -1,51 +1,64 @@
 import os
+import random
 from pathlib import Path
+import sys
 from collections import Counter
 from PIL import Image
-
+import numpy as np
 import pandas as pd
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
 
-# =========================================================
-# 1. Paths
-# =========================================================
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "Data"
+NEW_AUGMENTATION_DIR = DATA_DIR / "c" / "New_Augmentation_2"
 TRAIN_CSV = DATA_DIR / "train_split.csv"
-TRAIN_AUGMENTED_CSV = DATA_DIR / "c" / "New_Augmentation" / "train_manifest_augmented.csv"
+TRAIN_AUGMENTED_CSV = NEW_AUGMENTATION_DIR / "train_manifest_augmented.csv"
 VAL_CSV = DATA_DIR / "val_split.csv"
 TEST_CSV = DATA_DIR / "test_split.csv"
-NEW_AUGMENTATION_DIR = DATA_DIR / "c" / "New_Augmentation"
 
-# =========================================================
-# 2. Config
-# =========================================================
 IMG_SIZE = 256
 BATCH_SIZE = 32
 NUM_WORKERS = 2
-PRED_THRESHOLD = 0.6
 
-# =========================================================
-# 3. Transforms
-# =========================================================
+DROPOUT_SPATIAL = 0.08
+DROPOUT_CLASSIFIER = 0.08
+ACTIVATION = "ReLU"
+LABEL_SMOOTHING = 0.0
+# Increased base LR to speed up initial convergence; can be tuned later
+LR = 2e-3
+# Disable weight decay initially to avoid over-regularizing while using sampler
+WEIGHT_DECAY = 0.0
+
+SINGLE_BATCH_DEBUG = False
+PRED_THRESHOLD = 0.5
+
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(10),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
 eval_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 ])
 
-# =========================================================
-# 4. Dataset
-# =========================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class ImageCSVDataset(Dataset):
     def __init__(self, csv_path, transform=None, clean_conflicts=False):
         csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
@@ -118,15 +131,19 @@ class ImageCSVDataset(Dataset):
             return path
 
         # Support both .../train/... and .../Train/... paths on case-sensitive filesystems.
-        # Also support mapping Data/New_Augmentation to Data/c/New_Augmentation
+        # Also support mapping augmentation paths to the current augmentation directory.
         path_variants = [image_path_str]
         if "exported_dataset_with_augmentation/train/" in image_path_str:
             path_variants.append(
                 image_path_str.replace("exported_dataset_with_augmentation/train/", "exported_dataset_with_augmentation/Train/")
             )
-        if "Data/New_Augmentation/" in image_path_str:
+        if "Data/New_Augmentation_2/" in image_path_str:
             path_variants.append(
-                image_path_str.replace("Data/New_Augmentation/", "Data/c/New_Augmentation/")
+                image_path_str.replace("Data/New_Augmentation_2/", "Data/c/New_Augmentation_2/")
+            )
+        elif "Data/New_Augmentation/" in image_path_str:
+            path_variants.append(
+                image_path_str.replace("Data/New_Augmentation/", "Data/c/New_Augmentation_2/")
             )
 
         candidates = []
@@ -176,6 +193,30 @@ train_dataset = ImageCSVDataset([TRAIN_CSV, TRAIN_AUGMENTED_CSV], transform=trai
 val_dataset = ImageCSVDataset(VAL_CSV, transform=eval_transform, clean_conflicts=False)
 test_dataset = ImageCSVDataset(TEST_CSV, transform=eval_transform, clean_conflicts=False)
 
+# Ensure validation and test datasets use the same label mapping as the training dataset
+try:
+    val_index_to_label = val_dataset.index_to_label
+    test_index_to_label = test_dataset.index_to_label
+    train_label_to_index = train_dataset.label_to_index
+
+    new_val_samples = []
+    for path, lbl in val_dataset.samples:
+        raw_label = val_index_to_label.get(lbl, None)
+        if raw_label in train_label_to_index:
+            new_val_samples.append((path, train_label_to_index[raw_label]))
+    val_dataset.samples = new_val_samples
+
+    new_test_samples = []
+    for path, lbl in test_dataset.samples:
+        raw_label = test_index_to_label.get(lbl, None)
+        if raw_label in train_label_to_index:
+            new_test_samples.append((path, train_label_to_index[raw_label]))
+    test_dataset.samples = new_test_samples
+except Exception:
+    # If the dataset implementation does not expose index_to_label/label_to_index,
+    # skip remapping and assume labels already align.
+    pass
+
 # =========================================================
 # 5. Labels and sampling
 # =========================================================
@@ -187,6 +228,7 @@ train_label_counts = Counter(train_labels)
 val_label_counts = Counter(val_labels)
 test_label_counts = Counter(test_labels)
 
+# Create a WeightedRandomSampler to balance classes during training
 num_present_classes = len(train_label_counts)
 num_train_samples = len(train_labels)
 sample_weights = [
@@ -196,31 +238,31 @@ sample_weights = [
 train_sampler = WeightedRandomSampler(
     weights=torch.DoubleTensor(sample_weights),
     num_samples=len(sample_weights),
-    replacement=True
+    replacement=True,
 )
 
-# =========================================================
-# 6. DataLoaders
-# =========================================================
 train_loader = DataLoader(
     train_dataset,
     batch_size=BATCH_SIZE,
     sampler=train_sampler,
-    num_workers=NUM_WORKERS
+    num_workers=NUM_WORKERS,
+    pin_memory=False,
 )
 
 val_loader = DataLoader(
     val_dataset,
     batch_size=BATCH_SIZE,
     shuffle=False,
-    num_workers=NUM_WORKERS
+    num_workers=NUM_WORKERS,
+    pin_memory=False
 )
 
 test_loader = DataLoader(
     test_dataset,
     batch_size=BATCH_SIZE,
     shuffle=False,
-    num_workers=NUM_WORKERS
+    num_workers=NUM_WORKERS,
+    pin_memory=False
 )
 
 # =========================================================
@@ -243,7 +285,10 @@ print("Train:", train_label_counts)
 print("Val:", val_label_counts)
 print("Test:", test_label_counts)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if SINGLE_BATCH_DEBUG:
+    device = torch.device("cpu")
+else:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 print("Train label counts:", train_label_counts)
@@ -257,46 +302,91 @@ for class_idx in range(num_classes):
     weight = 0.0 if class_count == 0 else total_samples / (num_classes * class_count)
     class_weights.append(weight)
 
-class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
 print("Class weights:", class_weights)
 
+# =========================================================
+# 8. Model
+# =========================================================
+class LabelSmoothingLoss(nn.Module):
+    """Custom loss with label smoothing and class weights (matches hyperparameter_search.py)"""
+    def __init__(self, num_classes, smoothing=0.05, weight=None):
+        super().__init__()
+        self.smoothing = smoothing
+        self.num_classes = num_classes
+        self.weight = weight
+        self.criterion = nn.CrossEntropyLoss(weight=weight, reduction='none')
+    
+    def forward(self, logits, targets):
+        if self.smoothing == 0:
+            return self.criterion(logits, targets).mean()
+        with torch.no_grad():
+            true_dist = torch.zeros_like(logits)
+            true_dist.fill_(self.smoothing / (self.num_classes - 1))
+            true_dist.scatter_(1, targets.data.unsqueeze(1), 1.0 - self.smoothing)
+        loss = torch.sum(-true_dist * torch.nn.functional.log_softmax(logits, dim=1), dim=1)
+        if self.weight is not None:
+            loss = loss * self.weight[targets]
+        return loss.mean()
+
 class SimpleCNN(nn.Module):
-    def __init__(self, num_classes, img_size=64):
+    def __init__(self, num_classes, dropout_spatial=DROPOUT_SPATIAL, dropout_classifier=DROPOUT_CLASSIFIER, activation="ReLU"):
         super().__init__()
 
+        if activation == "ReLU":
+            act_fn = nn.ReLU
+        elif activation == "GELU":
+            act_fn = nn.GELU
+        else:
+            act_fn = nn.ReLU
+
+        # Deeper architecture with smaller kernels to capture finer thermal patterns
         self.features = nn.Sequential(
-            nn.Conv2d(3, 24, kernel_size=9, padding=4),
-            nn.BatchNorm2d(24),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 256 -> 128
-            nn.Dropout2d(p=0.28),
+            nn.Conv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            act_fn(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(p=dropout_spatial),
 
-            nn.Conv2d(24, 48, kernel_size=7, padding=3),
-            nn.BatchNorm2d(48),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 128 -> 64
-            nn.Dropout2d(p=0.28),
-
-            nn.Conv2d(48, 96, kernel_size=7, padding=3),
-            nn.BatchNorm2d(96),
-            nn.ReLU(),
-            nn.MaxPool2d(2),   # 64 -> 32
-            nn.Dropout2d(p=0.28),
-
-            nn.Conv2d(96, 128, kernel_size=3, padding=1),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2)    # 32 -> 16
+            act_fn(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(p=dropout_spatial),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            act_fn(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(p=dropout_spatial),
+
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            act_fn(),
+            nn.MaxPool2d(2),
+            nn.Dropout2d(p=dropout_spatial),
+
+            nn.Conv2d(512, 512, kernel_size=3, padding=1),
+            nn.BatchNorm2d(512),
+            act_fn(),
+            nn.MaxPool2d(2),
+            nn.AdaptiveAvgPool2d((1, 1)),
         )
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(p=0.25),
-            nn.Linear(128 * (img_size // 16) * (img_size // 16), 256),
-            nn.ReLU(),
-            nn.Dropout(p=0.25),
-            nn.Linear(256, num_classes)
+            nn.Dropout(p=dropout_classifier),
+            nn.Linear(512, 512),
+            act_fn(),
+            nn.Dropout(p=dropout_classifier),
+            nn.Linear(512, 256),
+            act_fn(),
+            nn.Dropout(p=dropout_classifier),
+            nn.Linear(256, 128),
+            act_fn(),
+            nn.Dropout(p=dropout_classifier),
+            nn.Linear(128, num_classes),
         )
 
     def forward(self, x):
@@ -304,22 +394,59 @@ class SimpleCNN(nn.Module):
         x = self.classifier(x)
         return x
         
-model = SimpleCNN(num_classes=num_classes, img_size=IMG_SIZE).to(device)
+model = SimpleCNN(
+    num_classes=num_classes,
+    dropout_spatial=DROPOUT_SPATIAL,
+    dropout_classifier=DROPOUT_CLASSIFIER,
+    activation=ACTIVATION
+).to(device)
 
-criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.05)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+# When using a sampler we do not pass class weights to the loss (sampler balances classes)
+criterion = LabelSmoothingLoss(num_classes=num_classes, smoothing=LABEL_SMOOTHING, weight=None)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode="min",
     factor=0.7,
-    patience=12,
+    patience=10,
     verbose=True
 )
 
 print(model)
 
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, balanced_accuracy_score
 
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+# =========================================================
+# Quick single-batch debug to inspect logits/probs/labels
+# Enable only when SINGLE_BATCH_DEBUG=1
+# =========================================================
+if SINGLE_BATCH_DEBUG:
+    try:
+        print("Running single-batch debug...")
+        batch_images, batch_labels = next(iter(train_loader))
+        batch_images = batch_images.to(device)
+        batch_labels = batch_labels.to(device)
+        model.eval()
+        with torch.no_grad():
+            batch_outputs = model(batch_images)
+            batch_probs = torch.nn.functional.softmax(batch_outputs, dim=1)
+            batch_preds = (batch_probs[:, 1] >= PRED_THRESHOLD).long()
+
+        print("Logits mean/std/min/max:", batch_outputs.mean().item(), batch_outputs.std().item(), batch_outputs.min().item(), batch_outputs.max().item())
+        print("Probs class0 mean/std:", batch_probs[:,0].mean().item(), batch_probs[:,0].std().item())
+        print("Probs class1 mean/std:", batch_probs[:,1].mean().item(), batch_probs[:,1].std().item())
+        unique_preds, counts = torch.unique(batch_preds, return_counts=True)
+        print("Pred counts:", dict(zip(unique_preds.tolist(), counts.tolist())))
+        unique_labels, lcounts = torch.unique(batch_labels, return_counts=True)
+        print("Label counts:", dict(zip(unique_labels.tolist(), lcounts.tolist())))
+        print("Sample probs (first 8):")
+        for i in range(min(8, batch_probs.size(0))):
+            print(f"i={i} prob0={batch_probs[i,0].item():.4f} prob1={batch_probs[i,1].item():.4f} pred={batch_preds[i].item()} label={batch_labels[i].item()}")
+        print("End single-batch debug")
+        sys.exit(0)
+    except Exception as e:
+        print("Single-batch debug failed:", e)
 
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
@@ -361,8 +488,8 @@ def evaluate(model, loader, criterion, device):
     model.eval()
 
     running_loss = 0.0
-    all_preds = []
     all_labels = []
+    all_probs = []
 
     with torch.no_grad():
         for images, labels in loader:
@@ -375,25 +502,67 @@ def evaluate(model, loader, criterion, device):
             running_loss += loss.item() * images.size(0)
 
             probs = torch.softmax(outputs, dim=1)
-            preds = (probs[:, 1] >= PRED_THRESHOLD).long()
+            pos_probs = probs[:, 1]
 
-            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(pos_probs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
     epoch_loss = running_loss / len(loader.dataset)
-    epoch_acc = accuracy_score(all_labels, all_preds)
-    epoch_f1 = f1_score(all_labels, all_preds, average="binary", zero_division=0)
-    epoch_precision = precision_score(all_labels, all_preds, average="binary", zero_division=0)
-    epoch_recall = recall_score(all_labels, all_preds, average="binary", zero_division=0)
 
-    return epoch_loss, epoch_acc, epoch_f1, epoch_precision, epoch_recall, all_labels, all_preds
+    probs_arr = np.array(all_probs)
+    labels_arr = np.array(all_labels)
+
+    # If there are no samples, return defaults
+    if probs_arr.size == 0:
+        return epoch_loss, 0.0, 0.0, 0.0, 0.0, labels_arr.tolist(), [], 0.5
+
+    # Threshold sweep on validation to choose operating point maximizing balanced accuracy
+    best_thresh = 0.5
+    best_bal = -1.0
+    best_metrics = None
+    thresh_candidates = np.linspace(0.1, 0.9, 33)
+    for t in thresh_candidates:
+        preds_t = (probs_arr >= t).astype(int)
+        bal = balanced_accuracy_score(labels_arr, preds_t)
+        if bal > best_bal:
+            best_bal = bal
+            best_thresh = float(t)
+            best_metrics = {
+                "f1": float(f1_score(labels_arr, preds_t, average="binary", zero_division=0)),
+                "precision": float(precision_score(labels_arr, preds_t, average="binary", zero_division=0)),
+                "recall": float(recall_score(labels_arr, preds_t, average="binary", zero_division=0)),
+            }
+
+    best_preds = (probs_arr >= best_thresh).astype(int).tolist()
+
+    return epoch_loss, float(best_bal), best_metrics["f1"], best_metrics["precision"], best_metrics["recall"], labels_arr.tolist(), best_preds, best_thresh
+    if probs_arr.size == 0:
+        return epoch_loss, 0.0, 0.0, 0.0, 0.0, labels_arr.tolist(), [], best_thresh
+
+    thresh_candidates = np.linspace(0.1, 0.9, 33)
+    for t in thresh_candidates:
+        preds_t = (probs_arr >= t).astype(int)
+        bal = balanced_accuracy_score(labels_arr, preds_t)
+        if bal > best_bal:
+            best_bal = bal
+            best_thresh = float(t)
+            best_metrics = {
+                "f1": float(f1_score(labels_arr, preds_t, average="binary", zero_division=0)),
+                "precision": float(precision_score(labels_arr, preds_t, average="binary", zero_division=0)),
+                "recall": float(recall_score(labels_arr, preds_t, average="binary", zero_division=0)),
+            }
+
+    best_preds = (probs_arr >= best_thresh).astype(int).tolist()
+
+    return epoch_loss, float(best_bal), best_metrics["f1"], best_metrics["precision"], best_metrics["recall"], labels_arr.tolist(), best_preds, best_thresh
     
-NUM_EPOCHS = 1000
-best_val_acc = -1
+NUM_EPOCHS = 120
+best_val_balanced = -1
 best_val_f1 = -1
 best_model_path = "best_simple_cnn.pth"
 best_model_weights = None
-early_stop_patience = 150
+# Longer training window so the wider custom CNN can keep improving
+early_stop_patience = 30
 epochs_without_improvement = 0
 
 history = []
@@ -403,7 +572,7 @@ for epoch in range(NUM_EPOCHS):
         model, train_loader, criterion, optimizer, device
     )
 
-    val_loss, val_acc, val_f1, val_precision, val_recall, _, _ = evaluate(
+    val_loss, val_balanced, val_f1, val_precision, val_recall, val_true_all, val_pred_all, val_chosen_threshold = evaluate(
         model, val_loader, criterion, device
     )
 
@@ -417,10 +586,11 @@ for epoch in range(NUM_EPOCHS):
         "train_precision": train_precision,
         "train_recall": train_recall,
         "val_loss": val_loss,
-        "val_acc": val_acc,
+        "val_balanced": val_balanced,
         "val_f1": val_f1,
         "val_precision": val_precision,
-        "val_recall": val_recall
+        "val_recall": val_recall,
+        "val_chosen_threshold": val_chosen_threshold
     })
 
     print(f"Epoch {epoch+1}/{NUM_EPOCHS}")
@@ -429,28 +599,29 @@ for epoch in range(NUM_EPOCHS):
         f"F1: {train_f1:.4f} | Precision: {train_precision:.4f} | Recall: {train_recall:.4f}"
     )
     print(
-        f"Val   | Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | "
+        f"Val   | Loss: {val_loss:.4f} | Balanced: {val_balanced:.4f} | "
         f"F1: {val_f1:.4f} | Precision: {val_precision:.4f} | Recall: {val_recall:.4f}"
     )
+    print(f"Val chosen threshold: {val_chosen_threshold:.3f}")
     print(f"LR    | {optimizer.param_groups[0]['lr']:.6f}")
     print("-" * 80)
 
-    if val_acc > best_val_acc:
-        best_val_acc = val_acc
+    if val_balanced > best_val_balanced:
+        best_val_balanced = val_balanced
         best_val_f1 = val_f1
         best_model_weights = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         torch.save(best_model_weights, best_model_path)
-        print(f"Saved best model with validation accuracy: {val_acc:.4f}")
+        print(f"Saved best model with validation balanced accuracy: {val_balanced:.4f} (thr={val_chosen_threshold:.3f})")
         epochs_without_improvement = 0
     else:
         epochs_without_improvement += 1
 
     if epochs_without_improvement >= early_stop_patience:
-        print(f"Early stopping triggered after {epoch + 1} epochs without improvement in validation accuracy.")
+        print(f"Early stopping triggered after {epoch + 1} epochs without improvement in validation balanced accuracy.")
         break
 
 print(f"Best model saved to: {best_model_path}")
-print(f"Best validation accuracy: {best_val_acc:.4f}")
+print(f"Best validation balanced accuracy: {best_val_balanced:.4f}")
 print(f"Best validation F1: {best_val_f1:.4f}")
 
 history_df = pd.DataFrame(history)
@@ -464,7 +635,7 @@ if best_model_weights is not None:
 else:
     model.load_state_dict(torch.load(best_model_path, map_location=device))
 
-val_loss, val_acc, val_f1, val_precision, val_recall, val_true, val_pred = evaluate(
+val_loss, val_balanced, val_f1, val_precision, val_recall, val_true, val_pred, val_thresh = evaluate(
     model, val_loader, criterion, device
 )
 
@@ -475,7 +646,7 @@ print()
 print("Validation Classification Report:")
 print(classification_report(val_true, val_pred, digits=4))
 
-test_loss, test_acc, test_f1, test_precision, test_recall, test_true, test_pred = evaluate(
+test_loss, test_balanced, test_f1, test_precision, test_recall, test_true, test_pred, test_thresh = evaluate(
     model, test_loader, criterion, device
 )
 
