@@ -1,17 +1,84 @@
 # Thermal Imaging and CNN-based Machine Learning for Knee Pain Assessment
 
-## Project Status
+## Project Title & Abstract
+**Project Title:** Thermal Imaging and CNN-based Machine Learning for Knee Pain Assessment
 
-This project focuses on the development of a research-oriented deep learning pipeline for classifying clinically significant knee pain using infrared thermal images. The project is based on thermal knee images collected from soldiers across several visits, together with tabular clinical data containing patient identifiers, knee side, visit information, and pain-related labels.
+**Abstract:** This repository implements a reproducible, robust machine learning pipeline for the binary classification of clinical thermal knee images. By augmenting thermal imagery with tabular clinical metadata, the system is designed to predict clinically significant knee pain. The project encompasses rigorous exploratory data analysis (EDA) for both tabular and image modalities, strict patient-level data splitting to prevent leakage, manifest-driven dataset construction, and a parameterized convolutional neural network (`ConfigurableCNN`) trained using label smoothing. A comprehensive hyperparameter optimization stage ensures the model architecture and training dynamics are effectively tuned to address inherent clinical data challenges such as class imbalance.
 
-The overall goal is to build a supervised machine learning pipeline in which thermal knee images are preprocessed, matched with the relevant clinical labels, split correctly at the patient level, and then used to train and evaluate a Convolutional Neural Network (CNN) for binary pain classification.
+---
 
-At the current stage, the project is in the middle of the preprocessing and dataset-construction phase. The raw images were extracted from the medical system, and the relevant anatomical regions were manually segmented. In addition, several preprocessing and validation steps have already been implemented: loading all image files, resizing the images to a uniform format, checking consistency between the image-name prefix and the patient number (PN) in the Excel metadata file, attaching the appropriate label from the Excel file to each image, and identifying images that do not currently have a matching label.
+## Repository Structure
+The following core files constitute the analytical and modeling pipeline:
 
-These steps are essential because the project combines visual data with tabular clinical information. Therefore, before model training, it is necessary to ensure that every image is correctly linked to the relevant subject, visit, knee side, anatomical region, and pain label. This also helps prevent incorrect supervision and reduces the risk of data leakage or mislabeled samples.
+- `Tabular_EDA.ipynb` — Handles the exploratory data preparation for tabular clinical data. It standardizes identifiers, reshapes visual analog scale (VAS) data, merges labels and scores, and engineers features to export a clean tabular checkpoint.
+- `Image_EDA.ipynb` — Implements a strict, multi-step data pipeline for thermal image preprocessing. It manages image-metadata reconciliation, anatomical side consolidation, and leak-proof train/validation/test splits, outputting the final dataset manifests.
+- `hyperparameter_search.py` — The hyperparameter optimization driver. It orchestrates automated searches (using Random Search or Optuna) over a defined grid of architectural and learning parameters, evaluating and logging the best configurations.
+- `train.py` — The primary training and fine-tuning script. It instantiates the model and data loaders from the generated manifests, executes the training loop with class-weighted label smoothing loss, and records the training history and test set predictions.
+- `results_analysis.ipynb` — The post-training evaluation notebook. It ingests the exported training history and predictions to generate diagnostic visualizations (such as learning curves, confusion matrices, and ROC curves) and facilitates targeted error analysis.
 
-The next stages of the project include splitting the dataset by patients into training, validation, and test sets, so that images from the same patient do not appear in more than one subset. After that, data augmentation will be applied only to the training set in order to increase variability while preserving the validity of the validation and test sets. The final image arrays and label arrays will then be constructed and used as input for the CNN model.
+---
 
-After completing the preprocessing pipeline, the next major phase will be model development. This will include building the CNN architecture, training the model using the training set, tuning and monitoring performance on the validation set, and evaluating the final model on the test set. The evaluation will include standard classification metrics such as accuracy, ROC-AUC, sensitivity, and specificity, with particular attention to the clinical meaning of false negative predictions.
+## Data Preprocessing Pipeline
+The data preparation workflow is meticulously divided into tabular and image processing to ensure data integrity:
 
-The final stage of the project will include analysis of the results, discussion of model performance, identification of limitations, and formulation of conclusions regarding the ability to classify knee pain from thermal imaging data.
+- **Tabular Data Cleaning:** Clinical metadata is parsed to resolve missing values, encode categorical variables, and filter invalid diagnostic flags. The outcome is a consolidated baseline linking patient identifiers, visits, and pain outcome labels.
+- **Image & Metadata Reconciliation:** Raw thermal images are cross-referenced against the cleaned tabular data. Filenames are parsed to extract patient and visit metadata, ensuring every image maps to a valid clinical record.
+- **Normalization and Resizing:** Images are uniformly resized to a standard resolution (256x256) and normalized to stabilize gradient updates during network training.
+- **Label Derivation and Consolidation:** Clinical labels are engineered into a binary outcome. Knee side variables (left/right) and multi-visit data are carefully mapped to guarantee accurate label assignment per image.
+- **Leak-Proof Splitting:** Dataset manifests (`train_split.csv`, `val_split.csv`, `test_split.csv`) are generated with strict patient-level grouping. This ensures zero data leakage, meaning no single patient appears across multiple subsets. 
+
+---
+
+## Model Architecture
+- **ConfigurableCNN:** The core predictive model is a custom, lightweight convolutional neural network. The architecture utilizes increasing channel depths (24 -> 48 -> 96 -> 128) and adaptive average pooling to process spatial hierarchies. It is highly parameterized, allowing hyperparameters such as spatial dropout (`dropout_spatial`), dense dropout (`dropout_classifier`), and the activation function (e.g., `ReLU` or `GELU`) to be dynamically injected during optimization.
+- **Label Smoothing Loss:** To address the ambiguity and noise inherent in clinical datasets, the network optimizes a custom `LabelSmoothingLoss`. This approach softens the target distributions, preventing the network from producing overconfident predictions and serving as a strong regularization technique.
+
+---
+
+## Hyperparameter Optimization
+- **Search Strategy:** The pipeline supports systematic hyperparameter tuning using either Random Search or Bayesian Optimization via Optuna. Random Search operates as the default mechanism to efficiently explore high-dimensional spaces.
+- **Hyperparameter Grid:** The search space explores the following parameters to find the optimal model configuration:
+  - `dropout_spatial`: [0.2, 0.3, 0.4]
+  - `dropout_classifier`: [0.25, 0.35, 0.5]
+  - `label_smoothing`: [0.0, 0.05, 0.1]
+  - `activation`: ["ReLU", "GELU"]
+  - `weight_decay`: [1e-4, 5e-4, 1e-3]
+  - `lr` (learning rate): [1e-4, 5e-4, 1e-3]
+  - `threshold`: [0.5, 0.6, 0.7] (Optimization of the decision boundary to combat class imbalance)
+
+---
+
+## Training & Evaluation Pipeline
+- **Reproducibility:** The training environment enforces strict deterministic execution by freezing pseudorandom number generators across Python, NumPy, and PyTorch, and restricting cuDNN heuristics.
+- **Data Ingestion:** A custom PyTorch `Dataset` dynamically reads image paths from the CSV manifests, applies transformations, and yields tensor batches to the model.
+- **Imbalance Mitigation:** Inverse-frequency class weights are computed dynamically from the training manifest and passed to the loss function to penalize majority-class bias.
+- **Model Selection Criterion:** The training loop continuously monitors both training and validation losses. The optimal model state is captured and saved at the epoch where the **combined loss** (the absolute sum of training loss and validation loss) reaches its global minimum, indicating the best balance between data fitting and generalization.
+
+*(Note: Specific quantitative results, including accuracy, F1 scores, and loss values, are strictly withheld from this repository pending formal submission and publication in a peer-reviewed medical journal.)*
+
+---
+
+## Results Analysis
+The evaluation module provides a comprehensive suite of diagnostic tools without exposing raw patient data:
+- **Learning Curves:** Visualizes epoch-by-epoch tracking of training versus validation metrics to diagnose variance and bias.
+- **Confusion Matrix:** Aggregates test set predictions to illustrate the distribution of true positives, false positives, true negatives, and false negatives.
+- **ROC-AUC Metrics:** Computes the Receiver Operating Characteristic curve and the Area Under the Curve to evaluate the model's discriminative capacity across all theoretical probability thresholds.
+- **Error Analysis:** Isolates highest-confidence misclassifications (false positives and false negatives) to assist domain experts in understanding model failure modes.
+
+---
+
+## How to Run
+To reproduce the pipeline, execute the files in the following sequential order:
+
+1. **Tabular Preprocessing:**
+   - Execute `Tabular_EDA.ipynb` to clean the clinical metadata and generate the structured data checkpoint.
+2. **Image Preprocessing & Manifest Generation:**
+   - Execute `Image_EDA.ipynb` to reconcile images with tabular data, perform quality control, and export the strict patient-level split manifests (`train_split.csv`, `val_split.csv`, `test_split.csv`).
+3. **Hyperparameter Search:**
+   - Execute the search script to identify the optimal network architecture and training parameters.
+   - `python hyperparameter_search.py`
+4. **Model Training:**
+   - Execute the main training script to fine-tune the selected model configuration and export the test set predictions.
+   - `python train.py`
+5. **Results Analysis:**
+   - Open and execute `results_analysis.ipynb` to process the exported training history and prediction logs into publication-ready visualizations and metric reports.
