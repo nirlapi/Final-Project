@@ -25,7 +25,7 @@ The data preparation workflow is meticulously divided into tabular and image pro
 - **Image & Metadata Reconciliation:** Raw thermal images are cross-referenced against the cleaned tabular data. Filenames are parsed to extract patient and visit metadata, ensuring every image maps to a valid clinical record.
 - **Normalization and Resizing:** Images are uniformly resized to a standard resolution (256x256) and normalized to stabilize gradient updates during network training.
 - **Label Derivation and Consolidation:** Clinical labels are engineered into a binary outcome. Knee side variables (left/right) and multi-visit data are carefully mapped to guarantee accurate label assignment per image.
-- **Leak-Proof Splitting:** Dataset manifests (`train_split.csv`, `val_split.csv`, `test_split.csv`) are generated with strict patient-level grouping. This ensures zero data leakage, meaning no single patient appears across multiple subsets. 
+- **Leak-Proof Splitting:** Dataset manifests (`train_split.csv`, `val_split.csv`, `test_split.csv`) are generated with strict patient-level grouping. This ensures zero data leakage, meaning no single patient appears across multiple subsets.
 
 ---
 
@@ -82,3 +82,26 @@ To reproduce the pipeline, execute the files in the following sequential order:
    - `python train.py`
 5. **Results Analysis:**
    - Open and execute `results_analysis.ipynb` to process the exported training history and prediction logs into publication-ready visualizations and metric reports.
+
+---
+
+## Credits and Acknowledgments
+
+**Machine Learning and CNN Research:**
+- Nir Lapidot
+- Shiri Guniman
+
+**Project Mentors:**
+- Dr. Sharon Yalov-Handzel
+- Dr. Lilach Gavish
+- Dr. Oshrit Hoffer
+
+**Clinical Study, Data Collection, and Technical Assistance:**
+This study is based on thermal imaging and data collected as part of a previous clinical study on the treatment of anterior knee pain in combatants. We extend our gratitude to the following individuals and organizations for their vital contributions:
+- **Dr. Barzilay** (Principal Investigator)
+- **Dr. Gam** (Military Collaborator)
+- The Orthopedic Team, including **Dr. Spitzer**, **Dr. Friedman**, and **Dr. Lowe**, as well as the military physicians for their contribution to participant recruitment.
+- **Prof. Gertz** and **Prof. Eisenkraft** from the Institute for Military Medicine.
+- **Ms. Makhervax** for her technical assistance.
+
+This research was supported by the **Milgrom Family Foundation for Research in Military Medicine**.
