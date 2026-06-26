@@ -25,12 +25,8 @@ from sklearn.metrics import (
 )
 
 # =========================================================
-# 1. Reproducibility
+# שחזוריות
 # =========================================================
-# In hyperparameter optimization, strict reproducibility is mandatory. 
-# Without fixing these seeds, improvements in validation metrics could be 
-# falsely attributed to a hyperparameter change when they were actually caused 
-# by a lucky random weight initialization.
 SEED = 42
 
 random.seed(SEED)
@@ -38,23 +34,18 @@ np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
-# Forcing cuDNN determinism guarantees that the GPU uses the exact same convolution 
-# algorithm every time, ensuring runs are 100% reproducible at the cost of minor speed optimizations.
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # =========================================================
-# 2. Paths and General Settings
+# נתיבים והגדרות כלליות
 # =========================================================
-# Using pathlib allows for robust, OS-agnostic path resolutions.
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "Data"
 
 TRAIN_CSV = DATA_DIR / "train_split.csv"
 VAL_CSV = DATA_DIR / "val_split.csv"
 
-# Centralized output directory for logging the search process. This ensures 
-# that we don't overwrite previous independent experiments.
 OUTPUT_DIR = PROJECT_ROOT / "hyperparameter_search_outputs"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -68,40 +59,30 @@ BATCH_SIZE = 32
 NUM_WORKERS = 2
 
 EPOCHS = 75
-PATIENCE = 10     # Early stopping patience: halts training if no improvement after 10 epochs
-MIN_DELTA = 1e-4  # The minimum threshold of improvement required to reset the patience counter
+PATIENCE = 10
+MIN_DELTA = 1e-4
 
 # =========================================================
-# 3. Search Method Strategy
+# שיטת החיפוש
 # =========================================================
-# Options:
-# "random"  - Randomly samples from the grid. Often outperforms Grid Search because it explores 
-#             more unique values for the most important (high-sensitivity) parameters.
-# "grid"    - Exhaustively tests every possible combination. Computationally expensive.
-# "optuna"  - Uses Bayesian Optimization (Tree-structured Parzen Estimator) to intelligently 
-#             navigate the search space based on previous trial results.
-SEARCH_METHOD = "random"
+# אפשרויות:
+# "random"  - מומלץ כברירת מחדל
+# "grid"    - בודק את כל הקומבינציות
+# "optuna"  - דורש התקנה: pip install optuna
+SEARCH_METHOD = "optuna"
 
-# Number of random combinations to evaluate. 50-60 is an industry standard for 
-# finding near-optimal configurations without exhausting computational resources.
+# כמה קומבינציות אקראיות לבדוק מתוך הגריד.
+# 50–60 בדרך כלל נותן איזון טוב בין זמן ריצה לבין איכות החיפוש.
 N_RANDOM_RUNS = 50
 
-# Total number of trials for Optuna optimization if selected.
+# מספר ניסויי Optuna, אם SEARCH_METHOD = "optuna"
 N_OPTUNA_TRIALS = 30
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =========================================================
-# 4. Hyperparameter Grid
+# גריד היפר־פרמטרים
 # =========================================================
-# Defining the search space. Each parameter targets a specific optimization challenge:
-# - dropout_spatial: Drops entire 2D feature maps. Highly effective for CNNs to prevent co-adaptation of adjacent pixels.
-# - dropout_classifier: Standard dropout for dense layers to prevent memorization.
-# - label_smoothing: Softens targets to prevent the model from becoming overly confident, improving calibration.
-# - activation: Tests standard ReLU vs. GELU (which has a smoother, non-monotonic gradient near zero).
-# - weight_decay: L2 regularization penalty to keep network weights small and generalized.
-# - lr: Learning rate. Controls the step size of the Adam optimizer.
-# - threshold: The decision boundary for binary classification (tuning this is critical for imbalanced data).
 HYPERPARAMETER_GRID = {
     "dropout_spatial": [0.2, 0.3, 0.4],
     "dropout_classifier": [0.25, 0.35, 0.5],
@@ -113,7 +94,7 @@ HYPERPARAMETER_GRID = {
 }
 
 # =========================================================
-# 5. Dataset Definition
+# Dataset
 # =========================================================
 class ImageCSVDataset(Dataset):
     def __init__(
@@ -123,7 +104,6 @@ class ImageCSVDataset(Dataset):
         clean_conflicts=False,
         label_to_index=None
     ):
-        # Support loading multiple CSV manifests (e.g., standard train + augmented train)
         csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
 
         self.csv_paths = [Path(path) for path in csv_paths]
@@ -144,7 +124,6 @@ class ImageCSVDataset(Dataset):
             if not image_columns:
                 raise KeyError(f"{csv_file} must contain one of {image_column_candidates}")
 
-            # Drop unlabelled data to prevent NaN propagation during backpropagation
             data = data[data["pain_label"].notna()].copy()
 
             for column in image_columns:
@@ -159,14 +138,11 @@ class ImageCSVDataset(Dataset):
             if col in self.data.columns
         ]
 
-        # Dynamically resolve file paths. This ensures the pipeline doesn't crash 
-        # if the dataset is moved to a different machine or absolute path.
         self.data["_resolved_image_path"] = self.data.apply(
             self._resolve_row_image_path,
             axis=1
         )
 
-        # Filter out records where the physical image file is missing
         self.data = self.data[
             self.data["_resolved_image_path"].apply(lambda p: Path(p).exists())
         ].copy()
@@ -183,8 +159,6 @@ class ImageCSVDataset(Dataset):
         if not raw_labels:
             raise ValueError("No valid pain_label values found.")
 
-        # Create a strict mapping from label space to [0, num_classes-1] space.
-        # This is mathematically required by PyTorch's CrossEntropyLoss.
         if label_to_index is None:
             self.label_to_index = {
                 label: index
@@ -193,7 +167,6 @@ class ImageCSVDataset(Dataset):
         else:
             self.label_to_index = label_to_index
 
-            # Data Integrity Check: Ensure validation sets don't introduce unseen classes
             unknown_labels = set(raw_labels) - set(self.label_to_index.keys())
 
             if unknown_labels:
@@ -210,8 +183,6 @@ class ImageCSVDataset(Dataset):
         self.data = self.data[self.data["pain_label"].notna()].copy()
         self.data["pain_label"] = self.data["pain_label"].astype(int)
 
-        # Address label noise/conflict. If the same image path appears with different labels,
-        # we resolve the conflict by taking the statistical mode (most frequent label).
         if self.clean_conflicts:
             path_mode_label = self.data.groupby("_resolved_image_path")["pain_label"].agg(
                 lambda values: values.mode().iloc[0]
@@ -221,13 +192,11 @@ class ImageCSVDataset(Dataset):
                 path_mode_label
             ).astype(int)
 
-            # Deduplicate to prevent identical images from artificially biasing the training loss
             self.data = self.data.drop_duplicates(
                 subset=["_resolved_image_path"],
                 keep="first"
             ).copy()
 
-        # Cache paths and labels in memory for O(1) access time during training batches
         self.samples = [
             (row["_resolved_image_path"], int(row["pain_label"]))
             for _, row in self.data.iterrows()
@@ -285,8 +254,6 @@ class ImageCSVDataset(Dataset):
     def __getitem__(self, index):
         image_path, label = self.samples[index]
 
-        # Open image and enforce 3-channel RGB to ensure tensor dimensions remain consistent 
-        # (prevents crashes if a grayscale 1-channel image sneaks into the batch)
         with Image.open(image_path) as image:
             image = image.convert("RGB")
 
@@ -297,10 +264,8 @@ class ImageCSVDataset(Dataset):
 
 
 # =========================================================
-# 6. Data Transformations
+# טרנספורמציות
 # =========================================================
-# Normalization centers the pixel distribution around 0 with a range of [-1, 1].
-# This prevents gradient explosion and helps the Adam optimizer converge significantly faster.
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -320,10 +285,8 @@ eval_transform = transforms.Compose([
 ])
 
 # =========================================================
-# 7. CNN Model Architecture
+# מודל CNN
 # =========================================================
-# This architecture is parameterized to allow the search algorithm to dynamically 
-# inject different dropout rates and activation functions into the network topology.
 class ConfigurableCNN(nn.Module):
     def __init__(
         self,
@@ -334,7 +297,6 @@ class ConfigurableCNN(nn.Module):
     ):
         super().__init__()
 
-        # Dynamic activation selection for hyperparameter tuning
         if activation == "ReLU":
             act_fn = nn.ReLU
         elif activation == "GELU":
@@ -342,14 +304,12 @@ class ConfigurableCNN(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
-        # The feature extractor utilizes hierarchical representation learning.
-        # It expands channel depth (24 -> 48 -> 96 -> 128) while pooling spatial dimensions.
         self.features = nn.Sequential(
             nn.Conv2d(3, 24, kernel_size=9, padding=4),
             nn.BatchNorm2d(24),
             act_fn(),
             nn.MaxPool2d(2),
-            nn.Dropout2d(p=dropout_spatial), # Spatial dropout drops entire feature maps to force independent feature learning
+            nn.Dropout2d(p=dropout_spatial),
 
             nn.Conv2d(24, 48, kernel_size=7, padding=3),
             nn.BatchNorm2d(48),
@@ -368,8 +328,6 @@ class ConfigurableCNN(nn.Module):
             act_fn(),
             nn.MaxPool2d(2),
 
-            # Adaptive pooling forces the output to a 1x1 spatial resolution, rendering the 
-            # linear classifier agnostic to the original input image size.
             nn.AdaptiveAvgPool2d((1, 1))
         )
 
@@ -390,12 +348,8 @@ class ConfigurableCNN(nn.Module):
 
 
 # =========================================================
-# 8. Label Smoothing Loss
+# Label Smoothing Loss
 # =========================================================
-# Label smoothing modifies the Cross Entropy Loss. Instead of penalizing the model 
-# for not predicting a '1.0' probability for the true class, it penalizes it for not 
-# predicting a '1.0 - smoothing' probability (e.g., 0.95). 
-# This prevents overconfidence and improves generalization on noisy medical datasets.
 class LabelSmoothingLoss(nn.Module):
     def __init__(self, num_classes, smoothing=0.0, weight=None):
         super().__init__()
@@ -416,7 +370,6 @@ class LabelSmoothingLoss(nn.Module):
         if self.smoothing == 0.0:
             return self.ce_loss(logits, targets).mean()
 
-        # Construct the smoothed target distributions mathematically
         with torch.no_grad():
             true_dist = torch.zeros_like(logits)
             true_dist.fill_(self.smoothing / (self.num_classes - 1))
@@ -429,7 +382,6 @@ class LabelSmoothingLoss(nn.Module):
         log_probs = torch.nn.functional.log_softmax(logits, dim=1)
         loss = torch.sum(-true_dist * log_probs, dim=1)
 
-        # Apply inverse-frequency class weights if handling an imbalanced dataset
         if self.weight is not None:
             loss = loss * self.weight[targets]
 
@@ -437,10 +389,8 @@ class LabelSmoothingLoss(nn.Module):
 
 
 # =========================================================
-# 9. Evaluation Metrics
+# מדדים
 # =========================================================
-# We track multiple metrics because simple Accuracy is misleading on imbalanced datasets.
-# Balanced Accuracy and F1 Score provide a much truer picture of predictive power across both classes.
 def calculate_metrics(labels, preds):
     acc = accuracy_score(labels, preds)
     balanced_acc = balanced_accuracy_score(labels, preds)
@@ -461,10 +411,9 @@ def calculate_metrics(labels, preds):
 
 
 # =========================================================
-# 10. Training and Evaluation Routines
+# אימון והערכה
 # =========================================================
 def train_one_epoch(model, loader, criterion, optimizer, device, threshold):
-    # Sets modules like BatchNorm and Dropout to training mode
     model.train()
 
     running_loss = 0.0
@@ -475,25 +424,19 @@ def train_one_epoch(model, loader, criterion, optimizer, device, threshold):
         images = images.to(device)
         labels = labels.to(device)
 
-        # Clear old gradients to prevent accumulation across batches
         optimizer.zero_grad()
 
-        # Forward pass: Generate logits and compute the loss
         outputs = model(images)
         loss = criterion(outputs, labels)
 
-        # Backward pass: Compute gradients with respect to network weights
         loss.backward()
-        # Optimizer step: Update the weights
         optimizer.step()
 
         running_loss += loss.item() * images.size(0)
 
-        # Convert logits to probabilities and apply the dynamic threshold decision boundary
         probs = torch.softmax(outputs, dim=1)
         preds = (probs[:, 1] >= threshold).long()
 
-        # Detach from the computation graph to free GPU memory during tracking
         all_preds.extend(preds.detach().cpu().numpy())
         all_labels.extend(labels.detach().cpu().numpy())
 
@@ -504,14 +447,12 @@ def train_one_epoch(model, loader, criterion, optimizer, device, threshold):
 
 
 def evaluate(model, loader, criterion, device, threshold):
-    # Freezes Dropout layers and sets BatchNorm to use running population statistics
     model.eval()
 
     running_loss = 0.0
     all_preds = []
     all_labels = []
 
-    # torch.no_grad() halts gradient tracking entirely, significantly speeding up evaluation
     with torch.no_grad():
         for images, labels in loader:
             images = images.to(device)
@@ -535,10 +476,8 @@ def evaluate(model, loader, criterion, device, threshold):
 
 
 # =========================================================
-# 11. Helper Functions
+# פונקציות עזר
 # =========================================================
-# Calculates inverse frequency weights. This ensures that errors made on 
-# minority classes are penalized more heavily, guiding the optimizer to learn them.
 def compute_class_weights(labels, num_classes):
     label_counts = Counter(labels)
     num_samples = len(labels)
@@ -555,7 +494,6 @@ def compute_class_weights(labels, num_classes):
     return torch.tensor(weights, dtype=torch.float32)
 
 
-# Itertools product generates the Cartesian product of all parameters (for Grid Search)
 def get_all_grid_combinations(grid):
     from itertools import product
 
@@ -570,7 +508,6 @@ def get_all_grid_combinations(grid):
     return combinations
 
 
-# Shuffles the full grid and takes a slice, providing a uniform Random Search
 def get_random_combinations(grid, n_runs, seed=42):
     all_combinations = get_all_grid_combinations(grid)
 
@@ -582,7 +519,6 @@ def get_random_combinations(grid, n_runs, seed=42):
     return all_combinations[:n_selected]
 
 
-# Routing function to select the appropriate search methodology
 def get_search_combinations():
     all_combinations = get_all_grid_combinations(HYPERPARAMETER_GRID)
 
@@ -608,8 +544,6 @@ def get_search_combinations():
     raise ValueError(f"Unsupported SEARCH_METHOD: {SEARCH_METHOD}")
 
 
-# Defines the Optuna search space. Optuna will use a probabilistic model (TPE) 
-# to sample parameters intelligently based on the success of prior trials.
 def sample_params_with_optuna(trial):
     params = {
         "dropout_spatial": trial.suggest_float("dropout_spatial", 0.15, 0.45),
@@ -625,9 +559,8 @@ def sample_params_with_optuna(trial):
 
 
 # =========================================================
-# 12. Single Hyperparameter Trial Execution
+# ריצת אימון אחת עבור קומבינציית היפר־פרמטרים
 # =========================================================
-# This function encapsulates the entire lifecycle of a single model configuration.
 def run_single_hyperparameter_trial(
     run_idx,
     params,
@@ -650,7 +583,6 @@ def run_single_hyperparameter_trial(
         f"TH={params['threshold']:.3f}"
     )
 
-    # Re-seed at the start of every run to ensure isolation between trials
     torch.manual_seed(SEED + run_idx)
     torch.cuda.manual_seed_all(SEED + run_idx)
 
@@ -659,7 +591,7 @@ def run_single_hyperparameter_trial(
         batch_size=BATCH_SIZE,
         shuffle=True,
         num_workers=NUM_WORKERS,
-        pin_memory=torch.cuda.is_available() # Pin memory speeds up host-to-GPU data transfers
+        pin_memory=torch.cuda.is_available()
     )
 
     val_loader = DataLoader(
@@ -670,7 +602,6 @@ def run_single_hyperparameter_trial(
         pin_memory=torch.cuda.is_available()
     )
 
-    # Inject trial-specific architectural parameters into the model
     model = ConfigurableCNN(
         num_classes=num_classes,
         dropout_spatial=params["dropout_spatial"],
@@ -678,7 +609,6 @@ def run_single_hyperparameter_trial(
         activation=params["activation"]
     ).to(device)
 
-    # Inject trial-specific training parameters into the Adam Optimizer
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=params["lr"],
@@ -691,7 +621,6 @@ def run_single_hyperparameter_trial(
         weight=class_weights
     )
 
-    # Early stopping trackers specific to this trial
     best_run_val_balanced_acc = -1.0
     best_run_state = None
     best_run_epoch = 0
@@ -720,7 +649,6 @@ def run_single_hyperparameter_trial(
             threshold=params["threshold"]
         )
 
-        # Log epoch-level metrics for retrospective analysis of training curves
         epoch_row = {
             "run": run_idx,
             "epoch": epoch,
@@ -744,7 +672,6 @@ def run_single_hyperparameter_trial(
 
         current_val_balanced_acc = val_metrics["balanced_accuracy"]
 
-        # Early Stopping Logic: If the model improves beyond MIN_DELTA, save it and reset patience.
         if current_val_balanced_acc > best_run_val_balanced_acc + MIN_DELTA:
             best_run_val_balanced_acc = current_val_balanced_acc
             best_run_state = copy.deepcopy(model.state_dict())
@@ -767,16 +694,13 @@ def run_single_hyperparameter_trial(
             f"Patience: {patience_counter}/{PATIENCE}"
         )
 
-        # Halt training if the model fails to learn for 'PATIENCE' consecutive epochs
         if patience_counter >= PATIENCE:
             print(f"  Early stopping at epoch {epoch}. Best epoch: {best_run_epoch}")
             break
 
-    # Restore the best state achieved during this specific trial
     if best_run_state is not None:
         model.load_state_dict(best_run_state)
 
-    # Compile the final statistics for this configuration
     result = {
         "run": run_idx,
         **params,
@@ -798,7 +722,6 @@ def run_single_hyperparameter_trial(
 
     results.append(result)
 
-    # Constantly flush to CSV so data is not lost if the script is interrupted
     pd.DataFrame(results).to_csv(RESULTS_CSV, index=False)
     pd.DataFrame(epoch_history).to_csv(EPOCH_HISTORY_CSV, index=False)
 
@@ -812,7 +735,6 @@ def run_single_hyperparameter_trial(
 
     print("-" * 120)
 
-    # Global Best Tracking: If this trial beats ALL previous trials, save it to disk as the master champion
     if best_run_val_balanced_acc > global_best_tracker["best_val_balanced_acc"]:
         global_best_tracker["best_val_balanced_acc"] = best_run_val_balanced_acc
         global_best_tracker["best_result"] = result
@@ -844,9 +766,8 @@ def run_single_hyperparameter_trial(
 
 
 # =========================================================
-# 13. Data Preparation
+# הכנת הדאטה
 # =========================================================
-# Orchestrates data loading and calculates foundational requirements like class distribution weighting.
 def prepare_data():
     print(f"Using device: {device}")
     print("Loading datasets...")
@@ -887,9 +808,8 @@ def prepare_data():
 
 
 # =========================================================
-# 14. Random Search / Grid Search Engine
+# Random Search / Grid Search
 # =========================================================
-# Iterates sequentially through pre-defined or randomized hyperparameter configurations.
 def run_random_or_grid_search():
     train_dataset, val_dataset, class_weights, num_classes = prepare_data()
 
@@ -929,10 +849,8 @@ def run_random_or_grid_search():
 
 
 # =========================================================
-# 15. Optuna Search Engine
+# Optuna Search
 # =========================================================
-# Integrates Optuna for Bayesian Optimization. Unlike Random/Grid search, 
-# Optuna learns from the results of previous iterations to "hone in" on the best params.
 def run_optuna_search():
     try:
         import optuna
@@ -951,7 +869,6 @@ def run_optuna_search():
         "best_result": None
     }
 
-    # The objective function defines the metric that Optuna will attempt to maximize.
     def objective(trial):
         run_idx = trial.number + 1
         params = sample_params_with_optuna(trial)
@@ -970,7 +887,6 @@ def run_optuna_search():
 
         return result["val_balanced_acc"]
 
-    # Tree-structured Parzen Estimator (TPE) is a Bayesian algorithm that models the parameter space
     sampler = optuna.samplers.TPESampler(seed=SEED)
 
     study = optuna.create_study(
@@ -998,7 +914,7 @@ def run_optuna_search():
 
 
 # =========================================================
-# 16. Main Entry Point
+# נקודת כניסה
 # =========================================================
 if __name__ == "__main__":
     print(f"Starting Hyperparameter Search at {datetime.now()}")
@@ -1006,12 +922,10 @@ if __name__ == "__main__":
     print(f"Search method: {SEARCH_METHOD}")
     print()
 
-    # Dry-run allows for testing data integrity (shapes, paths, labels) without spinning up training
     if "--dry-run" in os.sys.argv:
         prepare_data()
         raise SystemExit(0)
 
-    # Route execution based on configured search strategy
     if SEARCH_METHOD in ["random", "grid"]:
         results_df, epoch_history_df = run_random_or_grid_search()
 
@@ -1021,7 +935,6 @@ if __name__ == "__main__":
     else:
         raise ValueError(f"Unsupported SEARCH_METHOD: {SEARCH_METHOD}")
 
-    # Output generation: Display the top 10 winning configurations based on validation balanced accuracy
     print()
     print("=" * 120)
     print("SEARCH COMPLETE - TOP 10 CONFIGURATIONS BY VALIDATION BALANCED ACCURACY")
