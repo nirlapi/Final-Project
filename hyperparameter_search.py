@@ -25,7 +25,7 @@ from sklearn.metrics import (
 )
 
 # =========================================================
-# שחזוריות
+# Reproducibility and deterministic execution
 # =========================================================
 SEED = 42
 
@@ -38,7 +38,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 # =========================================================
-# נתיבים והגדרות כלליות
+# File paths and global configuration
 # =========================================================
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "Data"
@@ -63,25 +63,25 @@ PATIENCE = 10
 MIN_DELTA = 1e-4
 
 # =========================================================
-# שיטת החיפוש
+# Search strategy
 # =========================================================
-# אפשרויות:
-# "random"  - מומלץ כברירת מחדל
-# "grid"    - בודק את כל הקומבינציות
-# "optuna"  - דורש התקנה: pip install optuna
+# Supported options:
+# "random"  - Recommended default for practical runs
+# "grid"    - Evaluates every combination in the search space
+# "optuna"  - Requires installation: pip install optuna
 SEARCH_METHOD = "optuna"
 
-# כמה קומבינציות אקראיות לבדוק מתוך הגריד.
-# 50–60 בדרך כלל נותן איזון טוב בין זמן ריצה לבין איכות החיפוש.
+# Number of random combinations to sample from the full grid.
+# 50-60 usually gives a good balance between runtime and search quality.
 N_RANDOM_RUNS = 50
 
-# מספר ניסויי Optuna, אם SEARCH_METHOD = "optuna"
+# Number of Optuna trials when SEARCH_METHOD = "optuna"
 N_OPTUNA_TRIALS = 30
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =========================================================
-# גריד היפר־פרמטרים
+# Hyperparameter grid
 # =========================================================
 HYPERPARAMETER_GRID = {
     "dropout_spatial": [0.2, 0.3, 0.4],
@@ -94,7 +94,7 @@ HYPERPARAMETER_GRID = {
 }
 
 # =========================================================
-# Dataset
+# Dataset loading and indexing logic
 # =========================================================
 class ImageCSVDataset(Dataset):
     def __init__(
@@ -264,7 +264,7 @@ class ImageCSVDataset(Dataset):
 
 
 # =========================================================
-# טרנספורמציות
+# Image preprocessing transforms
 # =========================================================
 train_transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
@@ -285,7 +285,7 @@ eval_transform = transforms.Compose([
 ])
 
 # =========================================================
-# מודל CNN
+# CNN model definition
 # =========================================================
 class ConfigurableCNN(nn.Module):
     def __init__(
@@ -348,7 +348,7 @@ class ConfigurableCNN(nn.Module):
 
 
 # =========================================================
-# Label Smoothing Loss
+# Label smoothing loss
 # =========================================================
 class LabelSmoothingLoss(nn.Module):
     def __init__(self, num_classes, smoothing=0.0, weight=None):
@@ -389,7 +389,7 @@ class LabelSmoothingLoss(nn.Module):
 
 
 # =========================================================
-# מדדים
+# Evaluation metrics
 # =========================================================
 def calculate_metrics(labels, preds):
     acc = accuracy_score(labels, preds)
@@ -411,7 +411,7 @@ def calculate_metrics(labels, preds):
 
 
 # =========================================================
-# אימון והערכה
+# Training and evaluation loops
 # =========================================================
 def train_one_epoch(model, loader, criterion, optimizer, device, threshold):
     model.train()
@@ -476,7 +476,7 @@ def evaluate(model, loader, criterion, device, threshold):
 
 
 # =========================================================
-# פונקציות עזר
+# Helper utilities
 # =========================================================
 def compute_class_weights(labels, num_classes):
     label_counts = Counter(labels)
@@ -559,7 +559,7 @@ def sample_params_with_optuna(trial):
 
 
 # =========================================================
-# ריצת אימון אחת עבור קומבינציית היפר־פרמטרים
+# Single training run for one hyperparameter combination
 # =========================================================
 def run_single_hyperparameter_trial(
     run_idx,
@@ -766,7 +766,7 @@ def run_single_hyperparameter_trial(
 
 
 # =========================================================
-# הכנת הדאטה
+# Data preparation
 # =========================================================
 def prepare_data():
     print(f"Using device: {device}")
@@ -808,7 +808,7 @@ def prepare_data():
 
 
 # =========================================================
-# Random Search / Grid Search
+# Random search / grid search execution
 # =========================================================
 def run_random_or_grid_search():
     train_dataset, val_dataset, class_weights, num_classes = prepare_data()
@@ -849,7 +849,7 @@ def run_random_or_grid_search():
 
 
 # =========================================================
-# Optuna Search
+# Optuna search execution
 # =========================================================
 def run_optuna_search():
     try:
@@ -914,7 +914,7 @@ def run_optuna_search():
 
 
 # =========================================================
-# נקודת כניסה
+# Entry point
 # =========================================================
 if __name__ == "__main__":
     print(f"Starting Hyperparameter Search at {datetime.now()}")
